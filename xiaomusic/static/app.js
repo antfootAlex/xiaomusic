@@ -1,11 +1,11 @@
 $(function(){
   $container=$("#cmds");
-  append_op_button_name("下一首");
   append_op_button_name("全部循环");
-  append_op_button_name("关机");
   append_op_button_name("单曲循环");
-  append_op_button_name("播放歌曲");
   append_op_button_name("随机播放");
+  append_op_button_name("刷新列表");
+  append_op_button_name("下一首");
+  append_op_button_name("关机");
 
   $container.append($("<hr>"));
 
@@ -23,9 +23,71 @@ $(function(){
   // 拉取版本
   $.get("/getversion", function(data, status) {
     console.log(data, status, data["version"]);
-    $("#version").text(`(${data.version})`);
+    $("#version").text(`${data.version}`);
   });
 
+  // 拉取播放列表
+  function refresh_music_list() {
+    $('#music_list').empty();
+    $.get("/musiclist", function(data, status) {
+      console.log(data, status);
+      $.each(data, function(key, value) {
+        $('#music_list').append($('<option></option>').val(key).text(key));
+      });
+
+      $('#music_list').change(function() {
+        const selectedValue = $(this).val();
+        $('#music_name').empty();
+        const sorted_musics = data[selectedValue].sort(custom_sort_key);
+        $.each(sorted_musics, function(index, item) {
+          $('#music_name').append($('<option></option>').val(item).text(item));
+        });
+      });
+
+      $('#music_list').trigger('change');
+
+      // 获取当前播放列表
+      $.get("curplaylist", function(data, status) {
+        $('#music_list').val(data);
+        $('#music_list').trigger('change');
+      })
+    })
+  }
+  refresh_music_list();
+
+  $("#play_music_list").on("click", () => {
+    var music_list = $("#music_list").val();
+    var music_name = $("#music_name").val();
+    let cmd = "播放列表" + music_list + "|" + music_name;
+    sendcmd(cmd);
+  });
+
+  $("#del_music").on("click", () => {
+    var del_music_name = $("#music_name").val();
+    if (confirm(`确定删除歌曲 ${del_music_name} 吗？`)) {
+      console.log(`删除歌曲 ${del_music_name}`);
+      $.ajax({
+        type: 'POST',
+        url: '/delmusic',
+        data: JSON.stringify({"name": del_music_name}),
+        contentType: "application/json; charset=utf-8",
+        success: () => {
+          alert(`删除 ${del_music_name} 成功`);
+          refresh_music_list();
+        },
+        error: () => {
+          alert(`删除 ${del_music_name} 失败`);
+        }
+      });
+    }
+  });
+
+  $("#playurl").on("click", () => {
+    var url = $("#music-url").val();
+    $.get(`/playurl?url=${url}`, function(data, status) {
+      console.log(data);
+    });
+  });
 
   function append_op_button_name(name) {
     append_op_button(name, name);
@@ -48,8 +110,8 @@ $(function(){
 
   $("#play").on("click", () => {
     var search_key = $("#music-name").val();
-    var filename=$("#music-filename").val();
-    let cmd = "播放歌曲"+search_key+"|"+filename;
+    var filename = $("#music-filename").val();
+    let cmd = "播放歌曲" + search_key + "|" + filename;
     sendcmd(cmd);
   });
 
@@ -62,10 +124,12 @@ $(function(){
     $.ajax({
       type: "POST",
       url: "/cmd",
-      contentType: "application/json",
+      contentType: "application/json; charset=utf-8",
       data: JSON.stringify({cmd: cmd}),
       success: () => {
-        // 请求成功时执行的操作
+        if (cmd == "刷新列表") {
+          setTimeout(refresh_music_list, 3000);
+        }
       },
       error: () => {
         // 请求失败时执行的操作
@@ -107,4 +171,23 @@ $(function(){
   setInterval(() => {
     get_playing_music();
   }, 3000);
+
+  function custom_sort_key(a, b) {
+    // 使用正则表达式提取数字前缀
+    const numericPrefixA = a.match(/^(\d+)/) ? parseInt(a.match(/^(\d+)/)[1], 10) : null;
+    const numericPrefixB = b.match(/^(\d+)/) ? parseInt(b.match(/^(\d+)/)[1], 10) : null;
+
+    // 如果两个键都有数字前缀，则按数字大小排序
+    if (numericPrefixA !== null && numericPrefixB !== null) {
+      return numericPrefixA - numericPrefixB;
+    }
+
+    // 如果一个键有数字前缀而另一个没有，则有数字前缀的键排在前面
+    if (numericPrefixA !== null) return -1;
+    if (numericPrefixB !== null) return 1;
+
+    // 如果两个键都没有数字前缀，则按照常规字符串排序
+    return a.localeCompare(b);
+  }
+
 });

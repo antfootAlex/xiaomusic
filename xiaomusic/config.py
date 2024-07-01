@@ -3,46 +3,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Any, Iterable
+from dataclasses import dataclass
 
 from xiaomusic.utils import validate_proxy
 
-LATEST_ASK_API = "https://userprofile.mina.mi.com/device_profile/v2/conversation?source=dialogu&hardware={hardware}&timestamp={timestamp}&limit=2"
-COOKIE_TEMPLATE = "deviceId={device_id}; serviceToken={service_token}; userId={user_id}"
-HARDWARE_COMMAND_DICT = {
-    # hardware: (tts_command, wakeup_command, volume_command)
-    "LX06": ("5-1", "5-5", "2-1"),
-    "L05B": ("5-3", "5-4", "2-1"),    
-    "S12": ("5-1", "5-5", "2-1"),  # 第一代小爱，型号MDZ-25-DA
-    "S12A": ("5-1", "5-5", "2-1"),
-    "LX01": ("5-1", "5-5", "2-1"),
-    "L06A": ("5-1", "5-5", "2-1"),
-    "LX04": ("5-1", "5-4", "2-1"),
-    "L05C": ("5-3", "5-4", "2-1"),
-    "L17A": ("7-3", "7-4", "2-1"),
-    "X08E": ("7-3", "7-4", "2-1"),
-    "LX05A": ("5-1", "5-5", "2-1"),  # 小爱红外版
-    "LX5A": ("5-1", "5-5", "2-1"),  # 小爱红外版
-    "L07A": ("5-1", "5-5", "2-1"),  # Redmi小爱音箱Play(l7a)
-    "L15A": ("7-3", "7-4", "2-1"),
-    "X6A": ("7-3", "7-4", "2-1"),  # 小米智能家庭屏6
-    "X10A": ("7-3", "7-4", "2-1"),  # 小米智能家庭屏10
-    # add more here
-}
-
-DEFAULT_COMMAND = ("5-1", "5-5", "2-1")
-
-KEY_WORD_DICT = {
+# 默认口令
+DEFAULT_KEY_WORD_DICT = {
     "播放歌曲": "play",
-    "放歌曲": "play",
+    "播放本地歌曲": "playlocal",
+    "关机": "stop",
     "下一首": "play_next",
     "单曲循环": "set_play_type_one",
     "全部循环": "set_play_type_all",
     "随机播放": "random_play",
-    "关机": "stop",
-    "停止播放": "stop",
     "分钟后关机": "stop_after_minute",
+    "播放列表": "play_music_list",
+    "刷新列表": "gen_music_list",
     "set_volume#": "set_volume",
     "get_volume#": "get_volume",
 }
@@ -52,24 +28,19 @@ KEY_WORD_ARG_BEFORE_DICT = {
     "分钟后关机": True,
 }
 
-# 匹配优先级
-KEY_MATCH_ORDER = [
+# 口令匹配优先级
+DEFAULT_KEY_MATCH_ORDER = [
     "set_volume#",
     "get_volume#",
     "分钟后关机",
     "播放歌曲",
-    "放歌曲",
     "下一首",
     "单曲循环",
     "全部循环",
     "随机播放",
     "关机",
-    "停止播放",
-]
-
-SUPPORT_MUSIC_TYPE = [
-    ".mp3",
-    ".flac",
+    "刷新列表",
+    "播放列表",
 ]
 
 
@@ -79,11 +50,10 @@ class Config:
     account: str = os.getenv("MI_USER", "")
     password: str = os.getenv("MI_PASS", "")
     mi_did: str = os.getenv("MI_DID", "")
-    mute_xiaoai: bool = True
     cookie: str = ""
-    use_command: bool = False
-    verbose: bool = False
+    verbose: bool = os.getenv("XIAOMUSIC_VERBOSE", "").lower() == "true"
     music_path: str = os.getenv("XIAOMUSIC_MUSIC_PATH", "music")
+    conf_path: str = os.getenv("XIAOMUSIC_CONF_PATH", None)
     hostname: str = os.getenv("XIAOMUSIC_HOSTNAME", "192.168.2.5")
     port: int = int(os.getenv("XIAOMUSIC_PORT", "8090"))
     proxy: str | None = os.getenv("XIAOMUSIC_PROXY", None)
@@ -91,23 +61,58 @@ class Config:
         "XIAOMUSIC_SEARCH", "ytsearch:"
     )  # "bilisearch:" or "ytsearch:"
     ffmpeg_location: str = os.getenv("XIAOMUSIC_FFMPEG_LOCATION", "./ffmpeg/bin")
-    active_cmd: str = os.getenv("XIAOMUSIC_ACTIVE_CMD", "play,random_play")
+    active_cmd: str = os.getenv(
+        "XIAOMUSIC_ACTIVE_CMD", "play,random_play,playlocal,play_music_list,stop"
+    )
+    exclude_dirs: str = os.getenv("XIAOMUSIC_EXCLUDE_DIRS", "@eaDir")
+    music_path_depth: int = int(os.getenv("XIAOMUSIC_MUSIC_PATH_DEPTH", "10"))
+    disable_httpauth: bool = (
+        os.getenv("XIAOMUSIC_DISABLE_HTTPAUTH", "true").lower() == "true"
+    )
+    httpauth_username: str = os.getenv("XIAOMUSIC_HTTPAUTH_USERNAME", "admin")
+    httpauth_password: str = os.getenv("XIAOMUSIC_HTTPAUTH_PASSWORD", "admin")
+    music_list_url: str = os.getenv("XIAOMUSIC_MUSIC_LIST_URL", "")
+    music_list_json: str = os.getenv("XIAOMUSIC_MUSIC_LIST_JSON", "")
+    disable_download: bool = (
+        os.getenv("XIAOMUSIC_DISABLE_DOWNLOAD", "false").lower() == "true"
+    )
+    key_word_dict = DEFAULT_KEY_WORD_DICT.copy()
+    key_match_order = DEFAULT_KEY_MATCH_ORDER.copy()
+    use_music_api: bool = (
+        os.getenv("XIAOMUSIC_USE_MUSIC_API", "false").lower() == "true"
+    )
+    log_file: str = os.getenv("XIAOMUSIC_MUSIC_LOG_FILE", "/tmp/xiaomusic.txt")
+    # 模糊搜索匹配的最低相似度阈值
+    fuzzy_match_cutoff: float = float(os.getenv("XIAOMUSIC_FUZZY_MATCH_CUTOFF", "0.6"))
+    # 开启模糊搜索
+    enable_fuzzy_match: bool = (
+        os.getenv("XIAOMUSIC_ENABLE_FUZZY_MATCH", "true").lower() == "true"
+    )
+    stop_tts_msg: str = os.getenv("XIAOMUSIC_STOP_TTS_MSG", "收到,再见")
+
+    keywords_playlocal: str = os.getenv(
+        "XIAOMUSIC_KEYWORDS_PLAYLOCAL", "播放本地歌曲,本地播放歌曲"
+    )
+    keywords_play: str = os.getenv("XIAOMUSIC_KEYWORDS_PLAY", "播放歌曲,放歌曲")
+    keywords_stop: str = os.getenv("XIAOMUSIC_KEYWORDS_STOP", "关机,暂停,停止,停止播放")
+
+    def append_keyword(self, keys, action):
+        for key in keys.split(","):
+            self.key_word_dict[key] = action
+            if key not in self.key_match_order:
+                self.key_match_order.append(key)
 
     def __post_init__(self) -> None:
         if self.proxy:
             validate_proxy(self.proxy)
+        self.append_keyword(self.keywords_playlocal, "playlocal")
+        self.append_keyword(self.keywords_play, "play")
+        self.append_keyword(self.keywords_stop, "stop")
 
-    @property
-    def tts_command(self) -> str:
-        return HARDWARE_COMMAND_DICT.get(self.hardware, DEFAULT_COMMAND)[0]
-
-    @property
-    def wakeup_command(self) -> str:
-        return HARDWARE_COMMAND_DICT.get(self.hardware, DEFAULT_COMMAND)[1]
-
-    @property
-    def volume_command(self) -> str:
-        return HARDWARE_COMMAND_DICT.get(self.hardware, DEFAULT_COMMAND)[2]
+        # 保存配置到 config-example.json 文件
+        # with open("config-example.json", "w") as f:
+        #    data = asdict(self)
+        #    json.dump(data, f, ensure_ascii=False, indent=4)
 
     @classmethod
     def from_options(cls, options: argparse.Namespace) -> Config:

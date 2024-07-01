@@ -2,10 +2,10 @@
 # It is not intended for manual editing.
 
 [metadata]
-groups = ["default"]
+groups = ["default", "lint"]
 strategy = ["cross_platform"]
 lock_version = "4.4.1"
-content_hash = "sha256:d771311a452ca58665efe3b74af341cb202d75d83a250896c293ea9c696e5696"
+content_hash = "sha256:e7455b13bf13306ccf5ad11781191edb62991d9fbe8f8ce1e61a2f35c713cc2a"
 
 [[package]]
 name = "aiohttp"
@@ -357,6 +357,18 @@ files = [
 ]
 
 [[package]]
+name = "flask-httpauth"
+version = "4.8.0"
+summary = "HTTP authentication for Flask routes"
+dependencies = [
+    "flask",
+]
+files = [
+    {file = "Flask-HTTPAuth-4.8.0.tar.gz", hash = "sha256:66568a05bc73942c65f1e2201ae746295816dc009edd84b482c44c758d75097a"},
+    {file = "Flask_HTTPAuth-4.8.0-py3-none-any.whl", hash = "sha256:a58fedd09989b9975448eef04806b096a3964a7feeebc0a78831ff55685b62b0"},
+]
+
+[[package]]
 name = "flask"
 version = "3.0.3"
 extras = ["async"]
@@ -507,7 +519,7 @@ files = [
 
 [[package]]
 name = "miservice-fork"
-version = "2.5.0"
+version = "2.6.1"
 requires_python = ">=3.8"
 summary = "XiaoMi Cloud Service fork from https://github.com/Yonsm/MiService"
 dependencies = [
@@ -516,8 +528,8 @@ dependencies = [
     "rich",
 ]
 files = [
-    {file = "miservice_fork-2.5.0-py3-none-any.whl", hash = "sha256:97b6360ea53c34fe035ac9d94e8705f305b8fa7fc2b44a7aea182449a76cb622"},
-    {file = "miservice_fork-2.5.0.tar.gz", hash = "sha256:8ca2d370d5b32f7e330add38aa1912d734aefa7880f16cef9eac110a5a3029e2"},
+    {file = "miservice_fork-2.6.1-py3-none-any.whl", hash = "sha256:9b2cc4208486bbbf788d1bde6e2cbc70f241ce10db4dca6f918076a2d2942a39"},
+    {file = "miservice_fork-2.6.1.tar.gz", hash = "sha256:1702281e1e9827958eb3e82bc3242cd013c018e9aa1de8509b4805b5ccf5e60c"},
 ]
 
 [[package]]
@@ -646,6 +658,32 @@ dependencies = [
 files = [
     {file = "rich-13.7.1-py3-none-any.whl", hash = "sha256:4edbae314f59eb482f54e9e30bf00d33350aaa94f4bfcd4e9e3110e64d0d7222"},
     {file = "rich-13.7.1.tar.gz", hash = "sha256:9be308cb1fe2f1f57d67ce99e95af38a1e2bc71ad9813b0e247cf7ffbcc3a432"},
+]
+
+[[package]]
+name = "ruff"
+version = "0.5.0"
+requires_python = ">=3.7"
+summary = "An extremely fast Python linter and code formatter, written in Rust."
+files = [
+    {file = "ruff-0.5.0-py3-none-linux_armv6l.whl", hash = "sha256:ee770ea8ab38918f34e7560a597cc0a8c9a193aaa01bfbd879ef43cb06bd9c4c"},
+    {file = "ruff-0.5.0-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:38f3b8327b3cb43474559d435f5fa65dacf723351c159ed0dc567f7ab735d1b6"},
+    {file = "ruff-0.5.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:7594f8df5404a5c5c8f64b8311169879f6cf42142da644c7e0ba3c3f14130370"},
+    {file = "ruff-0.5.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:adc7012d6ec85032bc4e9065110df205752d64010bed5f958d25dbee9ce35de3"},
+    {file = "ruff-0.5.0-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:d505fb93b0fabef974b168d9b27c3960714d2ecda24b6ffa6a87ac432905ea38"},
+    {file = "ruff-0.5.0-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:9dc5cfd3558f14513ed0d5b70ce531e28ea81a8a3b1b07f0f48421a3d9e7d80a"},
+    {file = "ruff-0.5.0-py3-none-manylinux_2_17_ppc64.manylinux2014_ppc64.whl", hash = "sha256:db3ca35265de239a1176d56a464b51557fce41095c37d6c406e658cf80bbb362"},
+    {file = "ruff-0.5.0-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:b1a321c4f68809fddd9b282fab6a8d8db796b270fff44722589a8b946925a2a8"},
+    {file = "ruff-0.5.0-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:2c4dfcd8d34b143916994b3876b63d53f56724c03f8c1a33a253b7b1e6bf2a7d"},
+    {file = "ruff-0.5.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:81e5facfc9f4a674c6a78c64d38becfbd5e4f739c31fcd9ce44c849f1fad9e4c"},
+    {file = "ruff-0.5.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:e589e27971c2a3efff3fadafb16e5aef7ff93250f0134ec4b52052b673cf988d"},
+    {file = "ruff-0.5.0-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:d2ffbc3715a52b037bcb0f6ff524a9367f642cdc5817944f6af5479bbb2eb50e"},
+    {file = "ruff-0.5.0-py3-none-musllinux_1_2_i686.whl", hash = "sha256:cd096e23c6a4f9c819525a437fa0a99d1c67a1b6bb30948d46f33afbc53596cf"},
+    {file = "ruff-0.5.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:46e193b36f2255729ad34a49c9a997d506e58f08555366b2108783b3064a0e1e"},
+    {file = "ruff-0.5.0-py3-none-win32.whl", hash = "sha256:49141d267100f5ceff541b4e06552e98527870eafa1acc9dec9139c9ec5af64c"},
+    {file = "ruff-0.5.0-py3-none-win_amd64.whl", hash = "sha256:e9118f60091047444c1b90952736ee7b1792910cab56e9b9a9ac20af94cd0440"},
+    {file = "ruff-0.5.0-py3-none-win_arm64.whl", hash = "sha256:ed5c4df5c1fb4518abcb57725b576659542bdbe93366f4f329e8f398c4b71178"},
+    {file = "ruff-0.5.0.tar.gz", hash = "sha256:eb641b5873492cf9bd45bc9c5ae5320648218e04386a5f0c264ad6ccce8226a1"},
 ]
 
 [[package]]
@@ -794,7 +832,7 @@ files = [
 
 [[package]]
 name = "yt-dlp"
-version = "2024.5.16.232713.dev0"
+version = "2024.5.30.232720.dev0"
 requires_python = ">=3.8"
 summary = "A feature-rich command-line audio/video downloader"
 dependencies = [
@@ -808,6 +846,6 @@ dependencies = [
     "websockets>=12.0",
 ]
 files = [
-    {file = "yt_dlp-2024.5.16.232713.dev0-py3-none-any.whl", hash = "sha256:42d3c27ab77583ff67ee2ddc94e376ea2a76a561ed8b1836ee04fd1cd23ad88c"},
-    {file = "yt_dlp-2024.5.16.232713.dev0.tar.gz", hash = "sha256:d431187fa703c9f52225080ae56471272679e44d9363f97b7b3187d37a5e6480"},
+    {file = "yt_dlp-2024.5.30.232720.dev0-py3-none-any.whl", hash = "sha256:d6e563a2923807392325722028e7792e35affb694a505617b008195d0d212d2c"},
+    {file = "yt_dlp-2024.5.30.232720.dev0.tar.gz", hash = "sha256:9e2b177c5b13ea6f54cee1c56a69dd7832d506fba73a2247c6470e7d1952f959"},
 ]

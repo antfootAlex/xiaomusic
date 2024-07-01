@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 import os
-import sys
-import traceback
-import asyncio
-
-from flask import Flask, request, send_from_directory
-from waitress import serve
 from threading import Thread
 
-from xiaomusic.config import (
-    KEY_WORD_DICT,
-)
+from flask import Flask, request, send_file, send_from_directory
+from flask_httpauth import HTTPBasicAuth
+from waitress import serve
 
 from xiaomusic import (
     __version__,
 )
-
-# 隐藏 flask 启动告警
-# https://gist.github.com/jerblack/735b9953ba1ab6234abb43174210d356
-#from flask import cli
-#cli.show_server_banner = lambda *_: None
+from xiaomusic.utils import (
+    downloadfile,
+)
 
 app = Flask(__name__)
+auth = HTTPBasicAuth()
+
 host = "0.0.0.0"
 port = 8090
 static_path = "music"
@@ -29,9 +23,23 @@ xiaomusic = None
 log = None
 
 
+@auth.verify_password
+def verify_password(username, password):
+    if xiaomusic.config.disable_httpauth:
+        return True
+
+    if (
+        xiaomusic.config.httpauth_username == username
+        and xiaomusic.config.httpauth_password == password
+    ):
+        return username
+
+
 @app.route("/allcmds")
+@auth.login_required
 def allcmds():
-    return KEY_WORD_DICT
+    return xiaomusic.config.key_word_dict
+
 
 @app.route("/getversion", methods=["GET"])
 def getversion():
@@ -40,28 +48,42 @@ def getversion():
         "version": __version__,
     }
 
+
 @app.route("/getvolume", methods=["GET"])
+@auth.login_required
 def getvolume():
     volume = xiaomusic.get_volume_ret()
     return {
         "volume": volume,
     }
 
+
 @app.route("/searchmusic", methods=["GET"])
+@auth.login_required
 def searchmusic():
-    name = request.args.get('name')
+    name = request.args.get("name")
     return xiaomusic.searchmusic(name)
 
+
 @app.route("/playingmusic", methods=["GET"])
+@auth.login_required
 def playingmusic():
     return xiaomusic.playingmusic()
 
+
+@app.route("/isplaying", methods=["GET"])
+@auth.login_required
+def isplaying():
+    return xiaomusic.isplaying()
+
+
 @app.route("/", methods=["GET"])
-def redirect_to_index():
+def index():
     return send_from_directory("static", "index.html")
 
 
 @app.route("/cmd", methods=["POST"])
+@auth.login_required
 async def do_cmd():
     data = request.get_json()
     cmd = data.get("cmd")
@@ -71,7 +93,9 @@ async def do_cmd():
         return {"ret": "OK"}
     return {"ret": "Unknow cmd"}
 
+
 @app.route("/getsetting", methods=["GET"])
+@auth.login_required
 async def getsetting():
     config = xiaomusic.getconfig()
     log.debug(config)
@@ -85,15 +109,83 @@ async def getsetting():
         "mi_hardware_list": alldevices["hardware_list"],
         "xiaomusic_search": config.search_prefix,
         "xiaomusic_proxy": config.proxy,
+        "xiaomusic_music_list_url": config.music_list_url,
+        "xiaomusic_music_list_json": config.music_list_json,
     }
     return data
 
+
 @app.route("/savesetting", methods=["POST"])
+@auth.login_required
 async def savesetting():
     data = request.get_json()
     log.info(data)
     await xiaomusic.saveconfig(data)
     return "save success"
+
+
+@app.route("/musiclist", methods=["GET"])
+@auth.login_required
+async def musiclist():
+    return xiaomusic.get_music_list()
+
+
+@app.route("/curplaylist", methods=["GET"])
+@auth.login_required
+async def curplaylist():
+    return xiaomusic.get_cur_play_list()
+
+
+@app.route("/delmusic", methods=["POST"])
+@auth.login_required
+def delmusic():
+    data = request.get_json()
+    log.info(data)
+    xiaomusic.del_music(data["name"])
+    return "success"
+
+
+@app.route("/downloadjson", methods=["POST"])
+@auth.login_required
+def downloadjson():
+    data = request.get_json()
+    log.info(data)
+    url = data["url"]
+    try:
+        ret = "OK"
+        content = downloadfile(url)
+    except Exception as e:
+        log.warning(f"downloadjson failed. url:{url} e:{e}")
+        ret = "Download JSON file failed."
+    return {
+        "ret": ret,
+        "content": content,
+    }
+
+
+@app.route("/downloadlog", methods=["GET"])
+@auth.login_required
+def downloadlog():
+    return send_file(xiaomusic.config.log_file, as_attachment=True)
+
+
+@app.route("/playurl", methods=["GET"])
+@auth.login_required
+async def playurl():
+    url = request.args.get("url")
+    log.info(f"play_url:{url}")
+    return await xiaomusic.call_main_thread_function(xiaomusic.play_url, arg1=url)
+
+
+@app.route("/debug_play_by_music_url", methods=["POST"])
+@auth.login_required
+async def debug_play_by_music_url():
+    data = request.get_json()
+    log.info(f"data:{data}")
+    return await xiaomusic.call_main_thread_function(
+        xiaomusic.debug_play_by_music_url, arg1=data
+    )
+
 
 def static_path_handler(filename):
     log.debug(filename)
@@ -102,8 +194,10 @@ def static_path_handler(filename):
     log.debug(absolute_path)
     return send_from_directory(absolute_path, filename)
 
+
 def run_app():
     serve(app, host=host, port=port)
+
 
 def StartHTTPServer(_port, _static_path, _xiaomusic):
     global port, static_path, xiaomusic, log
