@@ -1,681 +1,773 @@
 #!/usr/bin/env python3
 import asyncio
-import json
 import logging
 import os
-import random
 import re
-import time
-import urllib.parse
-import traceback
-import mutagen
-import queue
-from xiaomusic.httpserver import StartHTTPServer
+from logging.handlers import RotatingFileHandler
 
-from pathlib import Path
+import aiohttp
 
-from aiohttp import ClientSession, ClientTimeout
-from miservice import MiAccount, MiIOService, MiNAService, miio_command
-from rich import print
-from rich.logging import RichHandler
-
-from xiaomusic.config import (
-    COOKIE_TEMPLATE,
-    LATEST_ASK_API,
-    KEY_WORD_DICT,
-    KEY_WORD_ARG_BEFORE_DICT,
-    KEY_MATCH_ORDER,
-    SUPPORT_MUSIC_TYPE,
-    Config,
+from xiaomusic import __version__
+from xiaomusic.analytics import Analytics
+from xiaomusic.auth import AuthManager
+from xiaomusic.command_handler import CommandHandler
+from xiaomusic.config import Config
+from xiaomusic.config_manager import ConfigManager
+from xiaomusic.const import (
+    PLAY_TYPE_ALL,
+    PLAY_TYPE_ONE,
+    PLAY_TYPE_RND,
+    PLAY_TYPE_SEQ,
+    PLAY_TYPE_SIN,
 )
-from xiaomusic.utils import (
-    parse_cookie_string,
-    fuzzyfinder,
-)
+from xiaomusic.conversation import ConversationPoller
+from xiaomusic.crontab import Crontab
+from xiaomusic.device_manager import DeviceManager
+from xiaomusic.events import CONFIG_CHANGED, DEVICE_CONFIG_CHANGED, EventBus
+from xiaomusic.file_watcher import FileWatcherManager
+from xiaomusic.music_library import MusicLibrary
+from xiaomusic.online_music import OnlineMusicService
+from xiaomusic.plugin import PluginManager
+from xiaomusic.utils.network_utils import download_plugin_audio, downloadfile
+from xiaomusic.utils.system_utils import deepcopy_data_no_sensitive_info
+from xiaomusic.utils.text_utils import chinese_to_number
 
-from xiaomusic import (
-    __version__,
-)
-
-EOF = object()
-
-PLAY_TYPE_ONE = 0  # 单曲循环
-PLAY_TYPE_ALL = 1  # 全部循环
 
 class XiaoMusic:
     def __init__(self, config: Config):
         self.config = config
 
-        self.mi_token_home = Path.home() / ".mi.token"
-        self.last_timestamp = int(time.time() * 1000)  # timestamp last call mi speaker
-        self.last_record = None
-        self.cookie_jar = None
-        self.device_id = ""
-        self.mina_service = None
-        self.miio_service = None
-        self.polling_event = asyncio.Event()
-        self.new_record_event = asyncio.Event()
-        self.queue = queue.Queue()
+        # 初始化事件总线
+        self.event_bus = EventBus()
 
-        self.music_path = config.music_path
-        self.hostname = config.hostname
-        self.port = config.port
-        self.proxy = config.proxy
-        self.search_prefix = config.search_prefix
-        self.ffmpeg_location = config.ffmpeg_location
-        self.active_cmd = config.active_cmd.split(",")
+        # 初始化认证管理器（延迟初始化部分属性）
+        self.auth_manager = None
 
-        # 下载对象
-        self.download_proc = None
-        # 单曲循环，全部循环
-        self.play_type = PLAY_TYPE_ALL
-        self.cur_music = ""
-        self._next_timer = None
-        self._timeout = 0
-        self._volume = 0
-        self._all_music = {}
-        self._play_list = []
-        self._playing = False
+        # 初始化设备管理器（延迟初始化）
+        self.device_manager = None
 
-        # 关机定时器
-        self._stop_timer = None
+        self.running_task = []
 
-        # setup logger
-        logging.basicConfig(
-            format=f"[{__version__}]\t%(message)s",
-            datefmt="[%X]",
-            handlers=[RichHandler(rich_tracebacks=True)]
+        # 音乐库管理器（延迟初始化，在配置准备好之后）
+        self.music_library = None
+
+        # 命令处理器（延迟初始化，在配置准备好之后）
+        self.command_handler = None
+
+        # 配置管理器（延迟初始化）
+        self.config_manager = None
+
+        # 初始化配置
+        self.init_config()
+
+        # 初始化文件监控管理器
+        self.file_watcher = None
+
+        # 初始化在线音乐服务（延迟初始化，在 js_plugin_manager 之后）
+        self.online_music_service = None
+
+        # 初始化对话轮询器（延迟初始化，在配置和服务准备好之后）
+        self.conversation_poller = None
+
+        # 初始化日志
+        self.setup_logger()
+
+        # 计划任务
+        self.crontab = Crontab(self.log)
+
+        # 初始化 JS 插件管理器
+        try:
+            from xiaomusic.js_plugin_manager import JSPluginManager
+
+            self.js_plugin_manager = JSPluginManager(self)
+            self.log.info("JS Plugin Manager initialized successfully")
+            self.js_plugin_manager.start_auto_convert()
+        except Exception as e:
+            self.log.error(f"Failed to initialize JS Plugin Manager: {e}")
+            self.js_plugin_manager = None
+
+        # 初始化 JS 插件适配器
+        try:
+            from xiaomusic.js_adapter import JSAdapter
+
+            self.js_adapter = JSAdapter(self)
+            self.log.info("JS Adapter initialized successfully")
+        except Exception as e:
+            self.log.error(f"Failed to initialize JS Adapter: {e}")
+
+        # 初始化配置管理器（在日志准备好之后）
+        self.config_manager = ConfigManager(
+            config=self.config,
+            log=self.log,
         )
-        self.log = logging.getLogger("xiaomusic")
-        self.log.setLevel(logging.DEBUG if config.verbose else logging.INFO)
-        self.log.debug(config)
 
         # 尝试从设置里加载配置
-        self.try_init_setting()
+        config_data = self.config_manager.try_init_setting()
+        if config_data:
+            self.update_config_from_setting(config_data)
+
+        # 初始化音乐库管理器（在配置准备好之后）
+        self.music_library = MusicLibrary(
+            config=self.config,
+            log=self.log,
+            event_bus=self.event_bus,
+        )
 
         # 启动时重新生成一次播放列表
-        self.gen_all_music_list()
+        self.music_library.gen_all_music_list()
 
-        # 启动时初始化获取声音
-        self.set_last_record("get_volume#")
-
-        self.log.debug("ffmpeg_location: %s", self.ffmpeg_location)
-
-    async def poll_latest_ask(self):
-        async with ClientSession() as session:
-            session._cookie_jar = self.cookie_jar
-            while True:
-                self.log.debug(
-                    "Listening new message, timestamp: %s", self.last_timestamp
-                )
-                await self.get_latest_ask_from_xiaoai(session)
-                start = time.perf_counter()
-                self.log.debug("Polling_event, timestamp: %s", self.last_timestamp)
-                await self.polling_event.wait()
-                if (d := time.perf_counter() - start) < 1:
-                    # sleep to avoid too many request
-                    self.log.debug("Sleep %f, timestamp: %s", d, self.last_timestamp)
-                    await asyncio.sleep(1 - d)
-
-    async def init_all_data(self, session):
-        await self.login_miboy(session)
-        await self._init_data_hardware()
-        session.cookie_jar.update_cookies(self.get_cookie())
-        self.cookie_jar = session.cookie_jar
-
-    async def login_miboy(self, session):
-        account = MiAccount(
-            session,
-            self.config.account,
-            self.config.password,
-            str(self.mi_token_home),
+        # 初始化在线音乐服务（在 js_plugin_manager 准备好之后）
+        self.online_music_service = OnlineMusicService(
+            log=self.log,
+            js_plugin_manager=self.js_plugin_manager,
+            xiaomusic_instance=self,  # 传递xiaomusic实例
         )
-        # Forced login to refresh to refresh token
-        await account.login("micoapi")
-        self.mina_service = MiNAService(account)
-        self.miio_service = MiIOService(account)
 
-    async def try_update_device_id(self):
-        hardware_data = await self.mina_service.device_list()
-        # fix multi xiaoai problems we check did first
-        # why we use this way to fix?
-        # some videos and articles already in the Internet
-        # we do not want to change old way, so we check if miotDID in `env` first
-        # to set device id
+        # 初始化设备管理器（在配置准备好之后）
+        self.device_manager = DeviceManager(
+            config=self.config,
+            log=self.log,
+            xiaomusic=self,
+        )
 
-        for h in hardware_data:
-            if did := self.config.mi_did:
-                if h.get("miotDID", "") == str(did):
-                    self.device_id = h.get("deviceID")
-                    break
-                else:
-                    continue
-            if h.get("hardware", "") == self.config.hardware:
-                self.device_id = h.get("deviceID")
-                break
-        else:
-            self.log.error(
-                f"we have no hardware: {self.config.hardware} please use `micli mina` to check"
-            )
+        # 初始化认证管理器（在配置和设备管理器准备好之后）
+        self.auth_manager = AuthManager(
+            config=self.config,
+            log=self.log,
+            device_manager=self.device_manager,
+        )
 
-    async def _init_data_hardware(self):
-        if self.config.cookie:
-            # if use cookie do not need init
-            return
-        await self.try_update_device_id()
-        if not self.config.mi_did:
-            devices = await self.miio_service.device_list()
+        # 初始化插件
+        self.plugin_manager = PluginManager(self)
+
+        # 初始化对话轮询器（在 device_id_did 准备好之后）
+        self.conversation_poller = ConversationPoller(
+            config=self.config,
+            log=self.log,
+            auth_manager=self.auth_manager,
+            device_manager=self.device_manager,
+        )
+
+        # 初始化命令处理器（在所有依赖准备好之后）
+        self.command_handler = CommandHandler(
+            config=self.config,
+            log=self.log,
+            xiaomusic_instance=self,
+        )
+
+        # 启动统计
+        self.analytics = Analytics(self.log, self.config)
+
+        # 订阅配置变更事件
+        self.event_bus.subscribe(CONFIG_CHANGED, self.save_cur_config)
+        self.event_bus.subscribe(DEVICE_CONFIG_CHANGED, self.save_cur_config)
+
+        debug_config = deepcopy_data_no_sensitive_info(self.config)
+        self.log.info(f"Startup OK. {debug_config}")
+
+        if self.config.conf_path == self.config.music_path:
+            self.log.warning("配置文件目录和音乐目录建议设置为不同的目录")
+
+    def init_config(self):
+        if not os.path.exists(self.config.music_path):
+            os.makedirs(self.config.music_path)
+
+        if not os.path.exists(self.config.download_path):
+            os.makedirs(self.config.download_path)
+
+        songs_cache_dir = os.path.join(
+            self.config.cache_dir, self.config.cache_song_name
+        )
+        if getattr(self.config, "cache_max_size_mb", 0) > 0 and not os.path.exists(
+            songs_cache_dir
+        ):
+            os.makedirs(songs_cache_dir, exist_ok=True)
+
+        self.continue_play = self.config.continue_play
+
+    def setup_logger(self):
+        log_format = f"%(asctime)s [{__version__}] [%(levelname)s] %(filename)s:%(lineno)d: %(message)s"
+        date_format = "[%Y-%m-%d %H:%M:%S]"
+        formatter = logging.Formatter(fmt=log_format, datefmt=date_format)
+
+        self.log = logging.getLogger("xiaomusic")
+        self.log.handlers.clear()  # 清除已有的 handlers
+        self.log.setLevel(logging.DEBUG if self.config.verbose else logging.INFO)
+
+        # 文件日志处理器
+        log_file = self.config.log_file
+        log_path = os.path.dirname(log_file)
+        if log_path and not os.path.exists(log_path):
+            os.makedirs(log_path)
+        if os.path.exists(log_file):
             try:
-                self.config.mi_did = next(
-                    d["did"]
-                    for d in devices
-                    if d["model"].endswith(self.config.hardware.lower())
-                )
-            except StopIteration:
-                self.log.error(
-                    f"cannot find did for hardware: {self.config.hardware} "
-                    "please set it via MI_DID env"
-                )
-
-    def get_cookie(self):
-        if self.config.cookie:
-            cookie_jar = parse_cookie_string(self.config.cookie)
-            # set attr from cookie fix #134
-            cookie_dict = cookie_jar.get_dict()
-            self.device_id = cookie_dict["deviceId"]
-            return cookie_jar
-        else:
-            with open(self.mi_token_home) as f:
-                user_data = json.loads(f.read())
-            user_id = user_data.get("userId")
-            service_token = user_data.get("micoapi")[1]
-            cookie_string = COOKIE_TEMPLATE.format(
-                device_id=self.device_id, service_token=service_token, user_id=user_id
-            )
-            return parse_cookie_string(cookie_string)
-
-    async def get_latest_ask_from_xiaoai(self, session):
-        retries = 3
-        for i in range(retries):
-            try:
-                timeout = ClientTimeout(total=15)
-                r = await session.get(
-                    LATEST_ASK_API.format(
-                        hardware=self.config.hardware,
-                        timestamp=str(int(time.time() * 1000)),
-                    ),
-                    timeout=timeout,
-                )
+                os.remove(log_file)
             except Exception as e:
-                self.log.warning(
-                    "Execption when get latest ask from xiaoai: %s", str(e)
-                )
-                continue
-            try:
-                data = await r.json()
-            except Exception:
-                self.log.warning("get latest ask from xiaoai error, retry")
-                if i == 2:
-                    # tricky way to fix #282 #272 # if it is the third time we re init all data
-                    self.log.info("Maybe outof date trying to re init it")
-                    await self.init_all_data(self.session)
-            else:
-                return self._get_last_query(data)
+                print(f"无法删除旧日志文件: {log_file} {e}")
 
-    def _get_last_query(self, data):
-        if d := data.get("data"):
-            records = json.loads(d).get("records")
-            if not records:
-                return
-            last_record = records[0]
-            timestamp = last_record.get("time")
-            if timestamp > self.last_timestamp:
-                self.last_timestamp = timestamp
-                self.last_record = last_record
-                self.new_record_event.set()
-
-    # 手动发消息
-    def set_last_record(self, query):
-        self.last_record = {
-            "query": query,
-            "ctrl_panel": True,
-        }
-        self.new_record_event.set()
-
-    async def do_tts(self, value):
-        self.log.info("do_tts: %s", value)
-
-        if self.config.mute_xiaoai:
-            await self.force_stop_xiaoai()
-        else:
-            # waiting for xiaoai speaker done
-            await asyncio.sleep(8)
-
-        if not self.config.use_command:
-            try:
-                await self.mina_service.text_to_speech(self.device_id, value)
-            except Exception:
-                pass
-        else:
-            await miio_command(
-                self.miio_service,
-                self.config.mi_did,
-                f"{self.config.tts_command} {value}",
-            )
-
-    async def do_set_volume(self, value):
-        value = int(value)
-        self._volume = value
-        self.log.info(f"声音设置为{value}")
-        if not self.config.use_command:
-            try:
-                self.log.debug("do_set_volume not use_command value:%d", value)
-                await self.mina_service.player_set_volume(self.device_id, value)
-            except Exception:
-                pass
-        else:
-            self.log.debug("do_set_volume use_command value:%d", value)
-            await miio_command(
-                self.miio_service,
-                self.config.mi_did,
-                f"{self.config.volume_command}=#{value}",
-            )
-
-    async def force_stop_xiaoai(self):
-        await self.mina_service.player_stop(self.device_id)
-
-    # 是否在下载中
-    def is_downloading(self):
-        if not self.download_proc:
-            return False
-        if self.download_proc.returncode != None and self.download_proc.returncode < 0:
-            return False
-        return True
-
-    # 下载歌曲
-    async def download(self, search_key, name):
-        if self.download_proc:
-            try:
-                self.download_proc.kill()
-            except ProcessLookupError:
-                pass
-
-        sbp_args = (
-            "yt-dlp",
-            f"{self.search_prefix}{search_key}",
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--paths",
-            self.music_path,
-            "-o",
-            f"{name}.mp3",
-            "--ffmpeg-location",
-            f"{self.ffmpeg_location}",
-            "--no-playlist",
+        file_handler = RotatingFileHandler(
+            self.config.log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=1,
+            encoding="utf-8",
         )
+        file_handler.stream.flush()
+        file_handler.setFormatter(formatter)
+        self.log.addHandler(file_handler)
 
-        if self.proxy:
-            sbp_args += ("--proxy", f"{self.proxy}")
+        # 控制台日志处理器
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        self.log.addHandler(console_handler)
 
-        self.download_proc = await asyncio.create_subprocess_exec(*sbp_args)
-        await self.do_tts(f"正在下载歌曲{search_key}")
+    async def analytics_task_daily(self):
+        while True:
+            await self.analytics.send_daily_event()
+            await asyncio.sleep(3600)
 
-    # 本地是否存在歌曲
-    def get_filename(self, name):
-        if name not in self._all_music:
-            self.log.debug("get_filename not in. name:%s", name)
-            return ""
-        filename = self._all_music[name]
-        self.log.debug("try get_filename. filename:%s", filename)
-        if os.path.exists(filename):
-            return filename
-        return ""
-
-    # 获取歌曲播放地址
-    def get_file_url(self, name):
-        filename = self.get_filename(name)
-        self.log.debug("get_file_url. name:%s, filename:%s", name, filename)
-        encoded_name = urllib.parse.quote(filename)
-        return f"http://{self.hostname}:{self.port}/{encoded_name}"
-
-    # 递归获取目录下所有歌曲,生成随机播放列表
-    def gen_all_music_list(self):
-        self._all_music = {}
-        for root, dirs, filenames in os.walk(self.music_path):
-            for filename in filenames:
-                self.log.debug("gen_all_music_list. filename:%s", filename)
-                # 过滤隐藏文件
-                if filename.startswith("."):
-                    continue
-                # 过滤非音乐文件
-                (name, extension) = os.path.splitext(filename)
-                self.log.debug(
-                    "gen_all_music_list. filename:%s, name:%s, extension:%s",
-                    filename,
-                    name,
-                    extension,
-                )
-                if extension not in SUPPORT_MUSIC_TYPE:
-                    continue
-
-                # 歌曲名字相同会覆盖
-                self._all_music[name] = os.path.join(root, filename)
-        self._play_list = list(self._all_music.keys())
-        random.shuffle(self._play_list)
-        self.log.debug(self._all_music)
-
-    # 把下载的音乐加入播放列表
-    def add_download_music(self, name):
-        self._all_music[name] = os.path.join(self.music_path, f"{name}.mp3")
-        if name not in self._play_list:
-            self._play_list.append(name)
-            self.log.debug("add_music %s", name)
-            self.log.debug(self._play_list)
-
-    # 获取下一首
-    def get_next_music(self):
-        play_list_len = len(self._play_list)
-        if play_list_len == 0:
-            self.log.warning(f"没有随机到歌曲")
-            return ""
-        # 随机选择一个文件
-        index = 0
+    def start_file_watch(self):
         try:
-            index = self._play_list.index(self.cur_music)
-        except ValueError:
-            pass
-        next_index = index + 1
-        if next_index >= play_list_len:
-            next_index = 0
-        filename = self._play_list[next_index]
-        return filename
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
 
-    # 获取文件播放时长
-    def get_file_duration(self, filename):
-        # 获取音频文件对象
-        audio = mutagen.File(filename)
-        # 获取播放时长
-        duration = audio.info.length
-        return duration
+        if not self.file_watcher:
+            self.file_watcher = FileWatcherManager(
+                config=self.config,
+                log=self.log,
+                on_change_callback=self._on_file_change,
+            )
+        self.file_watcher.start(loop)
 
-    # 设置下一首歌曲的播放定时器
-    def set_next_music_timeout(self):
-        filename = self.get_filename(self.cur_music)
-        sec = int(self.get_file_duration(filename))
-        self.log.info(f"歌曲 {self.cur_music} : {filename} 的时长 {sec} 秒")
-        if self._next_timer:
-            self._next_timer.cancel()
-            self.log.info(f"定时器已取消")
-        self._timeout = sec
+    def _on_file_change(self):
+        self.log.info("检测到目录音乐文件变化，正在刷新歌曲列表。")
+        self.music_library.gen_all_music_list()
+        # 更新每个设备的歌单
+        self.update_all_playlist()
 
-        async def _do_next():
-            await asyncio.sleep(self._timeout)
-            try:
-                await self.play_next()
-            except Exception as e:
-                self.log.warning(f"执行出错 {str(e)}\n{traceback.format_exc()}")
-
-        self._next_timer = asyncio.ensure_future(_do_next())
-        self.log.info(f"{sec}秒后将会播放下一首")
+    def stop_file_watch(self):
+        if self.file_watcher:
+            self.file_watcher.stop()
 
     async def run_forever(self):
-        StartHTTPServer(self.port, self.music_path, self)
-        async with ClientSession() as session:
-            self.session = session
-            await self.init_all_data(session)
-            task = asyncio.create_task(self.poll_latest_ask())
-            assert task is not None  # to keep the reference to task, do not remove this
-            filtered_keywords = [keyword for keyword in KEY_MATCH_ORDER if "#" not in keyword]
-            joined_keywords = "/".join(filtered_keywords)
-            self.log.info(
-                f"Running xiaomusic now, 用`{joined_keywords}`开头来控制"
-            )
-
-            while True:
-                self.polling_event.set()
-                await self.new_record_event.wait()
-                self.new_record_event.clear()
-                new_record = self.last_record
-                if new_record is None:
-                    # 其他线程的函数调用
-                    try:
-                        func, callback, arg1 = self.queue.get(False)
-                        ret = await func(arg1=arg1)
-                        callback(ret)
-                    except queue.Empty:
-                        pass
-                    continue
-                self.polling_event.clear()  # stop polling when processing the question
-                query = new_record.get("query", "").strip()
-                ctrl_panel = new_record.get("ctrl_panel", False)
-                self.log.debug("收到消息:%s 控制面板:%s", query, ctrl_panel)
-
-                # 匹配命令
-                opvalue, oparg = self.match_cmd(query, ctrl_panel)
-                if not opvalue:
-                    await asyncio.sleep(1)
-                    continue
-
-                try:
-                    func = getattr(self, opvalue)
-                    await func(arg1=oparg)
-                except Exception as e:
-                    self.log.warning(f"执行出错 {str(e)}\n{traceback.format_exc()}")
+        self.log.info("run_forever start")
+        self.music_library.try_gen_all_music_tag()  # 事件循环开始后调用一次
+        self.crontab.start()
+        await asyncio.create_task(self.analytics.send_startup_event())
+        # 取配置 enable_file_watch 循环开始时调用一次，控制目录监控开关
+        if self.config.enable_file_watch:
+            self.start_file_watch()
+        analytics_task = asyncio.create_task(self.analytics_task_daily())
+        assert (
+            analytics_task is not None
+        )  # to keep the reference to task, do not remove this
+        await self.auth_manager.init_all_data()
+        # 启动对话循环，传递回调函数
+        await self.conversation_poller.run_conversation_loop(
+            self.do_check_cmd, self.reset_timer_when_answer
+        )
 
     # 匹配命令
-    def match_cmd(self, query, ctrl_panel):
-        for opkey in KEY_MATCH_ORDER:
-            patternarg = rf"(.*){opkey}(.*)"
-            # 匹配参数
-            matcharg = re.match(patternarg, query)
-            if not matcharg:
-                # self.log.debug(patternarg)
-                continue
+    async def do_check_cmd(self, did="", query="", ctrl_panel=True, **kwargs):
+        """检查并执行命令（委托给 command_handler）"""
+        return await self.command_handler.do_check_cmd(did, query, ctrl_panel, **kwargs)
 
-            argpre = matcharg.groups()[0]
-            argafter = matcharg.groups()[1]
-            self.log.debug(
-                "matcharg. opkey:%s, argpre:%s, argafter:%s",
-                opkey,
-                argpre,
-                argafter,
-            )
-            oparg = argafter
-            opvalue = KEY_WORD_DICT[opkey]
-            if not ctrl_panel and not self._playing:
-                if self.active_cmd and opvalue not in self.active_cmd:
-                    self.log.debug(f"不在激活命令中 {opvalue}")
-                    continue
-            if opkey in KEY_WORD_ARG_BEFORE_DICT:
-                oparg = argpre
-            self.log.info(
-                "匹配到指令. opkey:%s opvalue:%s oparg:%s", opkey, opvalue, oparg
-            )
-            return (opvalue, oparg)
-        if self._playing:
-            self.log.info("未匹配到指令，自动停止")
-            return ("stop", {})
-        return (None, None)
+    # 重置计时器
+    async def reset_timer_when_answer(self, answer_length, did):
+        await self.device_manager.devices[did].reset_timer_when_answer(answer_length)
 
-    # 播放歌曲
-    async def play(self, **kwargs):
-        self._playing = True
-        parts = kwargs["arg1"].split("|")
+    def append_running_task(self, task):
+        self.running_task.append(task)
+
+    async def cancel_all_tasks(self):
+        if len(self.running_task) == 0:
+            self.log.info("cancel_all_tasks no task")
+            return
+        for task in self.running_task:
+            self.log.info(f"cancel_all_tasks {task}")
+            task.cancel()
+        await asyncio.gather(*self.running_task, return_exceptions=True)
+        self.running_task = []
+
+    async def is_task_finish(self):
+        if len(self.running_task) == 0:
+            return True
+        task = self.running_task[0]
+        if task and task.done():
+            return True
+        return False
+
+    async def check_replay(self, did):
+        return await self.device_manager.devices[did].check_replay()
+
+    def did_exist(self, did):
+        return did in self.device_manager.devices
+
+    # 播放一个 url
+    async def play_url(self, did="", arg1="", **kwargs):
+        self.log.info(f"手动推送链接：{arg1}")
+        url = arg1
+        return await self.device_manager.devices[did].group_player_play(url)
+
+    # 口令:单曲循环
+    async def set_play_type_one(self, did="", **kwargs):
+        await self.set_play_type(did, PLAY_TYPE_ONE)
+
+    # 口令:全部循环
+    async def set_play_type_all(self, did="", **kwargs):
+        await self.set_play_type(did, PLAY_TYPE_ALL)
+
+    # 口令:随机播放
+    async def set_play_type_rnd(self, did="", **kwargs):
+        await self.set_play_type(did, PLAY_TYPE_RND)
+
+    # 口令:单曲播放
+    async def set_play_type_sin(self, did="", **kwargs):
+        await self.set_play_type(did, PLAY_TYPE_SIN)
+
+    # 口令:顺序播放
+    async def set_play_type_seq(self, did="", **kwargs):
+        await self.set_play_type(did, PLAY_TYPE_SEQ)
+
+    async def set_play_type(self, did="", play_type=PLAY_TYPE_RND, dotts=True):
+        await self.device_manager.devices[did].set_play_type(play_type, dotts)
+
+    # 口令:刷新列表
+    async def gen_music_list(self, **kwargs):
+        self.music_library.gen_all_music_list()
+        self.update_all_playlist()
+        self.log.info("gen_music_list ok")
+
+    # 更新网络歌单
+    async def refresh_web_music_list(self, **kwargs):
+        url = self.config.music_list_url
+        if url:
+            self.log.debug(f"refresh_web_music_list begin url:{url}")
+            content = await downloadfile(url)
+            self.config.music_list_json = content
+            # 配置文件落地
+            self.save_cur_config()
+            self.log.debug(f"refresh_web_music_list url:{url} content:{content}")
+        self.log.info(f"refresh_web_music_list ok {url}")
+
+    # 口令:删除歌曲
+    async def cmd_del_music(self, did="", arg1="", **kwargs):
+        if not self.config.enable_cmd_del_music:
+            await self.do_tts(did, "语音删除歌曲功能未开启")
+            return
+        self.log.info(f"cmd_del_music {arg1}")
+        name = arg1
+        if len(name) == 0:
+            name = self.playingmusic(did)
+        await self.del_music(name)
+
+    async def del_music(self, name):
+        filename = self.music_library.get_filename(name)
+        if filename == "":
+            self.log.info(f"${name} not exist")
+            return
+        try:
+            os.remove(filename)
+            self.log.info(f"del ${filename} success")
+        except OSError:
+            self.log.error(f"del ${filename} failed")
+        # 重新生成音乐列表
+        self.music_library.gen_all_music_list()
+        self.update_all_playlist()
+
+    # ===========================在线搜索函数================================
+
+    def default_url(self, name="silence.mp3"):
+        """委托给 online_music_service"""
+        return self.online_music_service.default_url(name)
+
+    # 在线获取歌曲列表（委托给 online_music_service）
+    async def get_music_list_online(
+        self, plugin="all", keyword="", page=1, limit=20, **kwargs
+    ):
+        """委托给 online_music_service"""
+        return await self.online_music_service.get_music_list_online(
+            plugin, keyword, page, limit, **kwargs
+        )
+
+    # 在线获取歌单列表
+    async def get_playlist_online(
+        self, plugin="all", keyword="", page=1, limit=20, **kwargs
+    ):
+        """委托给 online_music_service"""
+        return await self.online_music_service.get_playlist_online(
+            plugin, keyword, page, limit, **kwargs
+        )
+
+    # 在线获取歌单内部歌曲详情
+    async def get_playlist_detail_online(self, id, plugin, api_type, **kwargs):
+        """委托给 online_music_service"""
+        return await self.online_music_service.get_playlist_detail_online(
+            id=id, plugin=plugin, api_type=api_type, **kwargs
+        )
+
+    @staticmethod
+    async def get_real_url_of_openapi(url: str, timeout: int = 10) -> str:
+        """委托给 OnlineMusicService 的静态方法"""
+        return await OnlineMusicService.get_real_url_of_openapi(url, timeout)
+
+    # 调用MusicFree插件获取歌曲列表（委托给 online_music_service）
+    async def get_music_list_mf(
+        self, plugin="all", keyword="", artist="", page=1, limit=20, **kwargs
+    ):
+        """委托给 online_music_service"""
+        return await self.online_music_service.get_music_list_mf(
+            plugin, keyword, artist, page, limit, **kwargs
+        )
+
+    # 调用MusicFree插件获取歌词（委托给 online_music_service）
+    async def get_media_lyric(self, music_item):
+        """委托给 online_music_service"""
+        return await self.online_music_service.get_media_lyric(music_item)
+
+    # 在线搜索歌手，添加歌手歌单并播放
+    async def search_singer_play(self, did, search_key, name):
+        """委托给 online_music_service"""
+        return await self.online_music_service.search_singer_play(did, search_key, name)
+
+    # 追加歌手歌曲
+    async def add_singer_song(self, list_name, name):
+        """委托给 online_music_service"""
+        return await self.online_music_service.add_singer_song(list_name, name)
+
+    # 在线搜索搜索最符合的一首歌并播放
+    async def search_top_one_play(self, did, search_key, name):
+        """委托给 online_music_service"""
+        return await self.online_music_service.search_top_one_play(
+            did, search_key, name
+        )
+
+    # 口令:在线播放：在线搜索、播放
+    async def online_play(self, did="", arg1="", **kwargs):
+        """委托给 online_music_service"""
+        return await self.online_music_service.online_play(did, arg1, **kwargs)
+
+    # 口令：搜索歌单
+    async def online_playlist_play(self, did="", arg1="", **kwargs):
+        """委托给 online_music_service"""
+        return await self.online_music_service.online_playlist_play(did, arg1, **kwargs)
+
+    # 口令:播放歌手：在线搜索歌手并存为列表播放
+    async def singer_play(self, did="", arg1="", **kwargs):
+        """委托给 online_music_service"""
+        return await self.online_music_service.singer_play(did, arg1, **kwargs)
+
+    # 处理推送的歌单并播放
+    async def push_music_list_play(self, did, song_list, list_name):
+        """委托给 online_music_service"""
+        return await self.online_music_service.push_music_list_play(
+            did, song_list, list_name
+        )
+
+    async def download_plugin_audio(self, url: str, save_path: str) -> bool:
+        """提供给插件或外部调用的独立流式音频下载接口"""
+        try:
+            # 独立开个 session，防止影响全局连接池
+            async with aiohttp.ClientSession() as session:
+                return await download_plugin_audio(session, url, save_path)
+        except Exception as e:
+            self.log.error(f"XiaoMusic.download_plugin_audio failed: {e}")
+            return False
+
+    # ===========================================================
+
+    def _find_real_music_list_name(self, list_name):
+        """模糊搜索播放列表名称（委托给 music_library）"""
+        return self.music_library.find_real_music_list_name(list_name)
+
+    # 口令:播放歌单
+    async def play_music_list(self, did="", arg1="", **kwargs):
+        parts = arg1.split("|")
+        list_name = parts[0]
+
+        music_name = ""
+        if len(parts) > 1:
+            music_name = parts[1]
+        return await self.do_play_music_list(did, list_name, music_name)
+
+    async def do_play_music_list(self, did, list_name, music_name=""):
+        # 查找并获取真实的音乐列表名称
+        list_name = self._find_real_music_list_name(list_name)
+        # 检查音乐列表是否存在，如果不存在则进行语音提示并返回
+        if list_name not in self.music_library.music_list:
+            await self.do_tts(did, f"播放列表{list_name}不存在")
+            return
+
+        # 调用设备播放音乐列表的方法
+        await self.device_manager.devices[did].play_music_list(list_name, music_name)
+
+    # 口令:播放列表第
+    async def play_music_list_index(self, did="", arg1="", **kwargs):
+        patternarg = r"^([零一二三四五六七八九十百千万亿]+)个(.*)"
+        # 匹配参数
+        matcharg = re.match(patternarg, arg1)
+        if not matcharg:
+            return await self.play_music_list(did, arg1)
+
+        chinese_index = matcharg.groups()[0]
+        list_name = matcharg.groups()[1]
+        list_name = self._find_real_music_list_name(list_name)
+        if list_name not in self.music_library.music_list:
+            await self.do_tts(did, f"播放列表{list_name}不存在")
+            return
+
+        index = chinese_to_number(chinese_index)
+        play_list = self.music_library.music_list[list_name]
+        if 0 <= index - 1 < len(play_list):
+            music_name = play_list[index - 1]
+            self.log.info(f"即将播放 ${arg1} 里的第 ${index} 个: ${music_name}")
+            await self.device_manager.devices[did].play_music_list(
+                list_name, music_name
+            )
+            return
+        await self.do_tts(did, f"播放列表{list_name}中找不到第${index}个")
+
+    # 口令:选择第几个
+    async def select_index(self, did="", arg1="", **kwargs):
+        patternarg = r"^第?([零一二三四五六七八九十百千万亿]+)[个首条集]$"
+        matcharg = re.match(patternarg, arg1)
+        if not matcharg:
+            return
+
+        chinese_index = matcharg.groups()[0]
+        index = chinese_to_number(chinese_index)
+
+        device = self.device_manager.devices.get(did)
+        if not device:
+            self.log.warning(f"设备 did:{did} 不存在")
+            return
+
+        await device.handle_selection(index)
+
+    # 口令:播放歌曲
+    async def play(self, did="", arg1="", **kwargs):
+        parts = arg1.split("|")
         search_key = parts[0]
         name = parts[1] if len(parts) > 1 else search_key
-        if search_key == "" and name == "":
-            await self.play_next()
-            return
-        if name == "":
+        if not name:
             name = search_key
-        self.log.debug("play. search_key:%s name:%s", search_key, name)
-        filename = self.get_filename(name)
 
-        if len(filename) <= 0:
-            await self.download(search_key, name)
-            self.log.info("正在下载中 %s", search_key + ":" + name)
-            await self.download_proc.wait()
-            # 把文件插入到播放列表里
-            self.add_download_music(name)
+        # 语音播放会根据歌曲匹配更新当前播放列表
+        return await self.do_play(did, name, search_key)
 
-        self.cur_music = name
-        self.log.info("cur_music %s", self.cur_music)
-        url = self.get_file_url(name)
-        self.log.info("播放 %s", url)
-        await self.force_stop_xiaoai()
-        await self.mina_service.play_by_url(self.device_id, url)
-        self.log.info("已经开始播放了")
-        # 设置下一首歌曲的播放定时器
-        self.set_next_music_timeout()
+    # 网页面板搜索播放
+    async def do_play(self, did, name, search_key=""):
+        return await self.device_manager.devices[did].play(name, search_key)
 
-    # 下一首
-    async def play_next(self, **kwargs):
-        self.log.info("下一首")
-        name = self.cur_music
-        self.log.debug("play_next. name:%s, cur_music:%s", name, self.cur_music)
-        if self.play_type == PLAY_TYPE_ALL or name == "":
-            name = self.get_next_music()
-        if name == "":
-            await self.do_tts(f"本地没有歌曲")
+    # 口令:播放本地歌曲
+    async def playlocal(self, did="", arg1="", **kwargs):
+        return await self.device_manager.devices[did].playlocal(arg1)
+
+    # 口令:下一首
+    async def play_next(self, did="", **kwargs):
+        return await self.device_manager.devices[did].play_next()
+
+    # 口令:上一首
+    async def play_prev(self, did="", **kwargs):
+        return await self.device_manager.devices[did].play_prev()
+
+    # 口令:停止
+    async def stop(self, did="", arg1="", **kwargs):
+        return await self.device_manager.devices[did].stop(arg1=arg1)
+
+    # 口令:分钟后关机
+    async def stop_after_minute(self, did="", arg1=0, **kwargs):
+        try:
+            # 尝试阿拉伯数字转换中文数字
+            minute = int(arg1)
+        except (KeyError, ValueError):
+            # 如果阿拉伯数字转换失败，尝试中文数字
+            minute = chinese_to_number(str(arg1))
+        return await self.device_manager.devices[did].stop_after_minute(minute)
+
+    # 口令:加入收藏,收藏歌曲
+    async def add_to_favorites(self, did="", arg1="", **kwargs):
+        name = arg1 if arg1 else self.playingmusic(did)
+        self.log.info(f"add_to_favorites {name}")
+        if not name:
+            self.log.warning("当前没有在播放歌曲，添加歌曲到收藏列表失败")
             return
-        await self.play(arg1=name)
 
-    # 单曲循环
-    async def set_play_type_one(self, **kwargs):
-        self.play_type = PLAY_TYPE_ONE
-        await self.do_tts(f"已经设置为单曲循环")
+        self.music_library.play_list_add_music("收藏", [name])
 
-    # 全部循环
-    async def set_play_type_all(self, **kwargs):
-        self.play_type = PLAY_TYPE_ALL
-        await self.do_tts(f"已经设置为全部循环")
+    # 口令:取消收藏
+    async def del_from_favorites(self, did="", arg1="", **kwargs):
+        name = arg1 if arg1 else self.playingmusic(did)
+        self.log.info(f"del_from_favorites {name}")
+        if not name:
+            self.log.warning("当前没有在播放歌曲，从收藏列表中移除失败")
+            return
 
-    # 随机播放
-    async def random_play(self, **kwargs):
-        self.play_type = PLAY_TYPE_ALL
-        await self.do_tts(f"已经设置为全部循环并随机播放")
-        # 重新生成随机播放列表
-        self.gen_all_music_list()
-        await self.play_next()
+        self.music_library.play_list_del_music("收藏", [name])
 
-    async def stop(self, **kwargs):
-        self._playing = False
-        if self._next_timer:
-            self._next_timer.cancel()
-            self.log.info(f"定时器已取消")
-        await self.force_stop_xiaoai()
+    # 更新每个设备的歌单
+    def update_all_playlist(self):
+        """更新每个设备的歌单"""
+        for device in self.device_manager.devices.values():
+            device.update_playlist()
 
-    async def stop_after_minute(self, **kwargs):
-        if self._stop_timer:
-            self._stop_timer.cancel()
-            self.log.info(f"关机定时器已取消")
-        minute = int(kwargs["arg1"])
+    # 获取音量
+    async def get_volume(self, did="", **kwargs):
+        return await self.device_manager.devices[did].get_volume()
 
-        async def _do_stop():
-            await asyncio.sleep(minute * 60)
-            try:
-                await self.stop()
-            except Exception as e:
-                self.log.warning(f"执行出错 {str(e)}\n{traceback.format_exc()}")
+    # 获取完整播放状态
+    async def get_player_status(self, did="", **kwargs):
+        return await self.device_manager.devices[did].get_player_status()
 
-        self._stop_timer = asyncio.ensure_future(_do_stop())
-        self.log.info(f"{minute}分钟后将关机")
+    # 设置音量
+    async def set_volume(self, did="", arg1=0, **kwargs):
+        if did not in self.device_manager.devices:
+            self.log.info(f"设备 did:{did} 不存在, 不能设置音量")
+            return
+        volume = int(arg1)
+        return await self.device_manager.devices[did].set_volume(volume)
 
-    async def set_volume(self, **kwargs):
-        value = kwargs["arg1"]
-        await self.do_set_volume(value)
-
-    async def get_volume(self, **kwargs):
-        playing_info = await self.mina_service.player_get_status(self.device_id)
-        self.log.debug("get_volume. playing_info:%s", playing_info)
-        self._volume = json.loads(playing_info.get("data", {}).get("info", "{}")).get("volume", 5)
-        self.log.info("get_volume. volume:%s", self._volume)
-
-    def get_volume_ret(self):
-        return self._volume
-
-    # 搜索音乐
-    def searchmusic(self, name):
-        search_list = fuzzyfinder(name, self._play_list)
-        self.log.debug("searchmusic. name:%s search_list:%s", name, search_list)
-        return search_list
+    # 获取当前的播放列表
+    def get_cur_play_list(self, did):
+        return self.device_manager.devices[did].get_cur_play_list()
 
     # 正在播放中的音乐
-    def playingmusic(self):
-        self.log.debug("playingmusic. cur_music:%s", self.cur_music)
-        return self.cur_music
+    def playingmusic(self, did):
+        cur_music = self.device_manager.devices[did].get_cur_music()
+        self.log.debug(f"playingmusic. cur_music:{cur_music}")
+        return cur_music
+
+    def get_offset_duration(self, did):
+        return self.device_manager.devices[did].get_offset_duration()
+
+    # 当前是否正在播放歌曲
+    def isplaying(self, did):
+        return self.device_manager.devices[did].is_playing
 
     # 获取当前配置
     def getconfig(self):
-        return self.config
-
-    def try_init_setting(self):
-        try:
-            filename = os.path.join(self.music_path, "setting.json")
-            with open(filename) as f:
-                data = json.loads(f.read())
-                self.update_config_from_setting(data)
-        except FileNotFoundError:
-            self.log.info(f"The file {filename} does not exist.")
-        except json.JSONDecodeError:
-            self.log.warning(f"The file {filename} contains invalid JSON.")
+        """获取当前配置（委托给 config_manager）"""
+        return self.config_manager.get_config()
 
     # 保存配置并重新启动
     async def saveconfig(self, data):
-        # 默认暂时配置保存到 music 目录下
-        filename = os.path.join(self.music_path, "setting.json")
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        """保存配置并重新启动"""
+        # 更新配置
         self.update_config_from_setting(data)
-        await self.call_main_thread_function(self.reinit)
+        # 配置文件落地
+        self.save_cur_config()
+        # 重新初始化
+        await self.reinit()
+
+    # 把当前配置落地
+    def save_cur_config(self):
+        """把当前配置落地（委托给 config_manager）"""
+        self.config_manager.save_cur_config(self.device_manager.devices)
 
     def update_config_from_setting(self, data):
-        self.config.mi_did = data["mi_did"]
-        self.config.hardware = data["mi_hardware"]
-        self.config.search_prefix = data["xiaomusic_search"]
-        self.config.proxy = data["xiaomusic_proxy"]
+        """从设置更新配置"""
+        # 委托给 config_manager 更新配置
+        self.config_manager.update_config(data)
 
-        self.search_prefix = self.config.search_prefix
-        self.proxy = self.config.proxy
-        self.log.info("update_config_from_setting ok. data:%s", data)
+        # 重新初始化配置相关的属性
+        self.init_config()
+
+        debug_config = deepcopy_data_no_sensitive_info(self.config)
+        self.log.info(f"update_config_from_setting ok. data:{debug_config}")
+
+        joined_keywords = "/".join(self.config.key_match_order)
+        self.log.info(f"语音控制已启动, 用【{joined_keywords}】开头来控制")
+        self.log.debug(f"key_word_dict: {self.config.key_word_dict}")
+
+        # 根据新配置控制文件监控
+        if self.config.enable_file_watch:
+            self.log.info("配置更新：开启目录监控")
+            self.start_file_watch()
+        else:
+            self.log.info("配置更新：关闭目录监控")
+            self.stop_file_watch()
+
+        # 重新加载计划任务
+        self.crontab.reload_config(self)
 
     # 重新初始化
-    async def reinit(self, **kwargs):
-        await self.try_update_device_id()
-        self.log.info("reinit success")
+    async def reinit(self):
+        for handler in self.log.handlers:
+            handler.close()
+        self.setup_logger()
+        await self.auth_manager.init_all_data()
+        self.music_library.gen_all_music_list()
+        self.update_all_playlist()
+
+        debug_config = deepcopy_data_no_sensitive_info(self.config)
+        self.log.info(f"reinit success. data:{debug_config}")
 
     # 获取所有设备
     async def getalldevices(self, **kwargs):
-        arg1 = kwargs["arg1"]
-        self.log.debug("getalldevices. arg1:%s", arg1)
-        did_list = []
-        hardware_list = []
-        hardware_data = await self.mina_service.device_list()
-        for h in hardware_data:
-            did = h.get("miotDID", "")
-            if did != "":
-                did_list.append(did)
-            hardware = h.get("hardware", "")
-            if h.get("hardware", "") != "":
-                hardware_list.append(hardware)
-        alldevices = {
-            "did_list": did_list,
-            "hardware_list": hardware_list,
-        }
-        return alldevices
+        device_list = []
+        try:
+            if self.auth_manager.mina_service is None:
+                self.log.warning("[DEVICE] mina_service 为空，尝试强制恢复登录")
+                await self.auth_manager.init_all_data(force_login=True)
+                if self.auth_manager.mina_service is None:
+                    self.log.warning("[DEVICE] 恢复登录后 mina_service 仍为空")
+                    return device_list
+            device_list = await self.auth_manager.mina_service.device_list()
+        except Exception as e:
+            self.log.warning(f"[DEVICE] getalldevices 异常: {e}")
+            self.log.info("[DEVICE] 强制重新登录后重试获取设备列表")
+            await self.auth_manager.init_all_data(force_login=True)
+            if self.auth_manager.mina_service is not None:
+                try:
+                    device_list = await self.auth_manager.mina_service.device_list()
+                    self.log.info(
+                        f"[DEVICE] 恢复成功，获取到 {len(device_list)} 个设备"
+                    )
+                except Exception as e2:
+                    self.log.warning(f"[DEVICE] 恢复后重试仍然失败: {e2}")
+        return device_list
 
-    # 用于在web线程里调用
-    # 获取所有设备
-    async def call_main_thread_function(self, func, arg1=None):
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
-        def callback(ret):
-            nonlocal future
-            loop.call_soon_threadsafe(future.set_result, ret)
-        self.queue.put((func, callback, arg1))
-        self.last_record = None
-        self.new_record_event.set()
-        result = await future
-        return result
+    async def debug_play_by_music_url(self, arg1=None):
+        if arg1 is None:
+            arg1 = {}
+        data = arg1
+        device_id = self.config.get_one_device_id()
+        self.log.info(f"debug_play_by_music_url: {data} {device_id}")
+        return await self.auth_manager.mina_service.ubus_request(
+            device_id,
+            "player_play_music",
+            "mediaplayer",
+            data,
+        )
 
+    async def exec(self, did="", arg1=None, **kwargs):
+        self.auth_manager._cur_did = did
+        code = arg1 if arg1 else 'code1("hello")'
+        await self.plugin_manager.execute_plugin(code)
+
+    # 此接口用于插件中获取当前设备
+    def get_cur_did(self):
+        return self.auth_manager._cur_did
+
+    async def do_tts(self, did, value):
+        return await self.device_manager.devices[did].do_tts(value)
+
+    async def handle_fatal_error(self, did, tts_msg="小music发生错误，请重试。"):
+        """全局异常报错处理：支持 TTS 或 xiaomusic_error.mp3 音效"""
+        # 1. 如果开启了 TTS，优先使用语音交互
+        if getattr(self.config, "edge_tts_voice", "disable") != "disable":
+            self.log.info(f"触发全局 TTS 报错: {tts_msg}")
+            await self.do_tts(did, tts_msg)
+            return
+
+        # 2. 如果关闭了 TTS，触发 error.mp3 报错音效
+        self.log.info("TTS 已关闭，触发全局 xiaomusic_error.mp3 报错音效")
+        error_url = self.default_url("xiaomusic_error.mp3")
+        # 播放报错音效
+        await self.play_url(did, error_url)
+        # 在第 3 秒时提前下发 stop，把硬件断流的咔声藏在静音里
+        import asyncio
+
+        await asyncio.sleep(3)
+        # 停止
+        await self.stop(did, "notts")
